@@ -12,10 +12,11 @@ wheels/
 *.egg
 
 # Virtual environments
-.venv/
-venv/
-env/
-ENV/
+/.venv/
+/venv/
+/env/
+/ENV/
+!src/vettor/env/
 
 # Tooling caches and test output
 .pytest_cache/
