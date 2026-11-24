@@ -1,4 +1,4 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -34,9 +34,11 @@ htmlcov/
 *.log
 logs/
 
-# Generated QA artifacts and local runtime state
+# Vettor runtime artifacts & local models
 artifacts/
 failures/
+models/
+*.gguf
 qa_memory.json
 results.csv
 results.json
@@ -48,6 +50,11 @@ form_recipe.json
 test_report.html
 test_config_dump.json
 test_cache.json
+vettor.json
+cases.jsonl
+
+# Documentation build output
+site/
 
 # Local diagnostic scratch scripts
 _diag_*.py
@@ -55,7 +62,7 @@ _diag_*.py
 # Local code index
 .codegraph/
 
-# OS and editor files
+# OS and IDE files
 .DS_Store
 Thumbs.db
 .idea/

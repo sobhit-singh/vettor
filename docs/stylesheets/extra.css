@@ -1,0 +1,87 @@
+/* Vettor Dark Minimalist Terminal Aesthetics */
+
+:root {
+  --md-primary-fg-color: #0d1117;
+  --md-default-bg-color: #0b0d12;
+  --md-default-fg-color: #e6edf3;
+  --md-accent-fg-color: #2dd4bf;
+  --md-code-bg-color: #161b22;
+  --md-code-fg-color: #f0f6fc;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  letter-spacing: -0.01em;
+}
+
+/* Monospace overrides for code & terminal outputs */
+code, kbd, pre, .terminal-box {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+}
+
+/* Terminal Hero Block */
+.terminal-hero {
+  background-color: #090c10;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  overflow-x: auto;
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #21262d;
+}
+
+.terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.terminal-dot.red { background-color: #ff5f56; }
+.terminal-dot.yellow { background-color: #ffbd2e; }
+.terminal-dot.green { background-color: #27c93f; }
+
+.terminal-title {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: #8b949e;
+}
+
+.terminal-content {
+  font-size: 0.88rem;
+  line-height: 1.6;
+  color: #c9d1d9;
+}
+
+.terminal-content .c-teal { color: #2dd4bf; }
+.terminal-content .c-green { color: #34d399; }
+.terminal-content .c-yellow { color: #fbbf24; }
+.terminal-content .c-blue { color: #60a5fa; }
+.terminal-content .c-purple { color: #c084fc; }
+.terminal-content .c-dim { color: #6e7681; }
+
+/* Crisp borders on cards & tables */
+.md-typeset table:not([class]) {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.md-typeset table:not([class]) th {
+  background-color: #161b22;
+  color: #f0f6fc;
+}
+
+.md-typeset .admonition {
+  border-radius: 6px;
+  border-left-width: 4px;
+}

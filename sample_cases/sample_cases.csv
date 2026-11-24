@@ -1,4 +1,0 @@
-case_id,full_name,age,smoker,coverage_amount,expected_premium
-1,Aarav Sharma,30,no,500000,345.00
-2,Priya Nair,45,yes,1000000,955.00
-3,Rohan Verma,28,no,750000,462.00
