@@ -1,17 +1,19 @@
 site_name: Vettor
 site_description: Autonomous web QA agent harness designed for deterministic replay, zero-egress privacy, and instant self-healing.
 site_url: https://vettor-ai.github.io/vettor/
-repo_url: https://github.com/vettor-ai/vettor
-repo_name: vettor-ai/vettor
+repo_url: https://github.com/sobhit-singh/vettor
+repo_name: sobhit-singh/vettor
 
 theme:
   name: material
+  custom_dir: docs/overrides
   palette:
     scheme: slate
     primary: black
-    accent: teal
+    accent: cyan
   features:
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
     - navigation.top
     - content.code.copy
