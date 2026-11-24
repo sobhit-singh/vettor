@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vettor"
+version = "0.1.0"
+description = "Autonomous agentic web QA harness with local and frontier LLMs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.85.0",
+    "openai>=1.50.0",
+    "rustwright>=0.1.0",
+    "playwright>=1.48.0",
+]
+
+[project.optional-dependencies]
+litellm = ["litellm>=1.40.0"]
+
+[project.scripts]
+vettor = "main:main"
+vettor-mock-site = "mockinsurancesite:main"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "*.py",
+    "sample_cases.csv",
+]

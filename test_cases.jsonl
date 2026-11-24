@@ -1,0 +1,3 @@
+{"case_id": "1", "name": "Standard Non-Smoker Base Quote", "full_name": "Aarav Sharma", "age": 30, "smoker": "no", "coverage_amount": 500000, "expected_premium": 345.00}
+{"case_id": "2", "name": "Smoker Surcharge High Coverage", "full_name": "Priya Nair", "age": 45, "smoker": "yes", "coverage_amount": 1000000, "expected_premium": 955.00}
+{"case_id": "3", "name": "Young Adult Medium Coverage", "full_name": "Rohan Verma", "age": 28, "smoker": "no", "coverage_amount": 750000, "expected_premium": 462.00}

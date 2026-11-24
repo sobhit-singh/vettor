@@ -1,0 +1,5 @@
+textual>=0.85.0
+openai>=1.50.0
+# litellm>=1.40.0  # optional: enables --backend litellm / multi-provider routing
+rustwright>=0.1.0
+playwright>=1.48.0

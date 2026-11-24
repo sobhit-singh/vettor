@@ -1,0 +1,62 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches and test output
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.coverage.*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Generated QA artifacts and local runtime state
+artifacts/
+failures/
+qa_memory.json
+results.csv
+results.json
+test_results_*.jsonl
+tui_trajectory.jsonl
+DEVELOPMENT_HANDOFF.md
+bugs.md
+form_recipe.json
+test_report.html
+test_config_dump.json
+test_cache.json
+
+# Local diagnostic scratch scripts
+_diag_*.py
+
+# Local code index
+.codegraph/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
