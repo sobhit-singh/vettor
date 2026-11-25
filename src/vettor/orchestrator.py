@@ -17,7 +17,7 @@ from vettor.agents.triage import TriageAgent
 from vettor.agents.ui import UIAgent
 from vettor.config import VettorConfig
 from vettor.core.events import EventBus, RunFinished, RunStarted
-from vettor.core.llm import ModelRouter
+from vettor.core.llm import ModelError, ModelRouter
 from vettor.core.memory import QAMemory
 from vettor.core.recipe import RecipeCache
 from vettor.core.schema import CaseResult, TestCase
@@ -44,7 +44,7 @@ class RunSummary(BaseModel):
 
 
 class Orchestrator:
-    """Async execution coordinator managing worker pools, agents, and artifact reporting."""
+    """Async execution coordinator managing worker pools, per-agent routers, and artifact reporting."""
 
     def __init__(
         self,
@@ -57,16 +57,25 @@ class Orchestrator:
         self.hitl_callback = hitl_callback
         self.stop_requested = False
 
+        # Primary router (typically local 2B SLM for fast functional execution)
         self.router = ModelRouter(cfg)
+        self._role_routers: dict[str, ModelRouter] = {}
+        self._frontier_router: ModelRouter | None = None
+
         self.recipe_cache = RecipeCache(cfg.reporting.recipe_path)
         self.memory = QAMemory(cfg.reporting.memory_path)
         self.handoff = HandoffManager(cfg.reporting.handoff_path)
 
-        self.ui_agent = UIAgent(cfg, self.router, self.bus, self.memory)
-        self.triage_agent = TriageAgent(cfg, self.router, self.bus, self.memory)
+        functional_router = self._router_for("functional")
+        ui_router = self._router_for("ui")
+        triage_router = self._router_for("triage", allow_frontier=True)
+        planner_router = self._router_for("planner", allow_frontier=True)
+
+        self.ui_agent = UIAgent(cfg, ui_router, self.bus, self.memory)
+        self.triage_agent = TriageAgent(cfg, triage_router, self.bus, self.memory)
         self.functional_agent = FunctionalityAgent(
             cfg=cfg,
-            router=self.router,
+            router=functional_router,
             bus=self.bus,
             memory=self.memory,
             recipe_cache=self.recipe_cache,
@@ -74,7 +83,60 @@ class Orchestrator:
             triage_agent=self.triage_agent,
             hitl_callback=self.hitl_callback,
         )
-        self.planner = TestCaseAgent(cfg, self.router, self.bus, self.memory)
+        self.planner = TestCaseAgent(cfg, planner_router, self.bus, self.memory)
+
+    def _router_for(self, role: str, *, allow_frontier: bool = False) -> ModelRouter:
+        """Resolves a dedicated ModelRouter for an agent role, falling back to self.router."""
+        override = self.cfg.model.resolve_agent_model(role)
+        if override and override != self.cfg.model.active:
+            if override not in self._role_routers:
+                try:
+                    self._role_routers[override] = ModelRouter(self.cfg.for_agent(role))
+                    logger.info("Agent '%s' routed to override model: %s", role, override)
+                except ModelError as exc:
+                    logger.warning(
+                        "Override model '%s' for agent '%s' blocked/unavailable (%s); falling back to %s",
+                        override,
+                        role,
+                        exc,
+                        self.cfg.model.active,
+                    )
+                    return self.router
+            return self._role_routers[override]
+
+        if (
+            allow_frontier
+            and not self.cfg.model.confidential
+            and self.cfg.model.frontier_model
+            and self.cfg.model.frontier_endpoint
+        ):
+            if self._frontier_router is None:
+                try:
+                    candidate = ModelRouter(self.cfg, use_frontier=True)
+                    if candidate.providers:
+                        self._frontier_router = candidate
+                        logger.info("Agent '%s' routed to frontier model: %s", role, self.cfg.model.frontier_model)
+                except ModelError as exc:
+                    logger.warning("Frontier router unavailable for '%s' (%s); falling back to primary", role, exc)
+            if self._frontier_router is not None:
+                return self._frontier_router
+
+        return self.router
+
+    async def aclose(self) -> None:
+        """Closes all unique ModelRouter instances created by this Orchestrator."""
+        unique_routers: list[ModelRouter] = [self.router]
+        for r in self._role_routers.values():
+            if r not in unique_routers:
+                unique_routers.append(r)
+        if self._frontier_router and self._frontier_router not in unique_routers:
+            unique_routers.append(self._frontier_router)
+
+        for r in unique_routers:
+            try:
+                await r.aclose()
+            except Exception:
+                pass
 
     def load_cases(self, path: str | Path | None = None) -> list[TestCase]:
         """Loads test cases from a .jsonl, .json, or .csv file, normalizing each row."""
@@ -127,12 +189,15 @@ class Orchestrator:
 
     async def plan_suite(self, url: str, instruction: str = "") -> list[TestCase]:
         """Explores the target URL and generates a structured test suite."""
-        async with BrowserPool(self.cfg) as pool:
-            session = await pool.new_session()
-            try:
-                return await self.planner.plan_from_page(session, url, instruction)
-            finally:
-                await session.close()
+        try:
+            async with BrowserPool(self.cfg) as pool:
+                session = await pool.new_session()
+                try:
+                    return await self.planner.plan_from_page(session, url, instruction)
+                finally:
+                    await session.close()
+        finally:
+            await self.aclose()
 
     async def run(self, cases: list[TestCase] | None = None) -> RunSummary:
         """Executes the test suite according to the configured mode (data_driven, autonomous_goal, crawl_smoke)."""
@@ -147,7 +212,14 @@ class Orchestrator:
         elif mode == "autonomous_goal":
             test_cases = [TestCase(case_id="goal-1", name="Autonomous Goal", goal=self.cfg.suite.goal)]
         elif mode == "crawl_smoke":
-            test_cases = await self.plan_suite(self.cfg.target.url, instruction="Smoke test key workflows")
+            async with BrowserPool(self.cfg) as pool:
+                session = await pool.new_session()
+                try:
+                    test_cases = await self.planner.plan_from_page(
+                        session, self.cfg.target.url, instruction="Smoke test key workflows"
+                    )
+                finally:
+                    await session.close()
 
         await self.bus.emit(RunStarted(total_cases=len(test_cases), metadata={"mode": mode}))
 
@@ -162,27 +234,29 @@ class Orchestrator:
                     return CaseResult(case_id=tc.case_id, status="ERROR", note="Run cancelled by user")
 
                 async with sem:
-                    session = await pool.new_session()
+                    session = await pool.new_session(storage_state=tc.storage_state)
                     try:
                         res = await self.functional_agent.run_case(session, tc)
 
-                        # Evaluate assertions if test case reached verification
-                        final_obs = await session.observe()
-                        assertion_results = evaluate_assertions(
-                            tc,
-                            final_obs,
-                            res.extracted,
-                            float_tolerance=self.cfg.reporting.float_tolerance,
-                        )
-                        res.assertions = assertion_results
+                        # B-23: Skip assertions on ERROR; use captured final_observation from agent
+                        if res.status != "ERROR":
+                            final_obs = res.final_observation or await session.observe()
+                            if not res.assertions:
+                                tol = tc.tolerance if tc.tolerance is not None else self.cfg.reporting.float_tolerance
+                                res.assertions = evaluate_assertions(
+                                    tc,
+                                    final_obs,
+                                    res.extracted,
+                                    float_tolerance=tol,
+                                )
+                            if any(not a.passed for a in res.assertions):
+                                res.status = "FAIL"
+                                if not res.screenshot:
+                                    res.screenshot = await self.functional_agent._capture_screenshot(session, tc.case_id)
 
-                        # If any assertion failed, case fails
-                        if any(not a.passed for a in assertion_results):
-                            res.status = "FAIL"
-
-                        # Log findings to handoff
+                        obs_url = (res.final_observation.url if res.final_observation else "") or self.cfg.target.url
                         for f in res.findings:
-                            self.handoff.record_finding(f, case_id=tc.case_id, url=final_obs.url)
+                            self.handoff.record_finding(f, case_id=tc.case_id, url=obs_url)
 
                         # Stream JSONL if enabled
                         if self.cfg.reporting.stream_jsonl:
@@ -199,17 +273,23 @@ class Orchestrator:
                     finally:
                         await session.close()
 
-            # Execute cases
             tasks = [asyncio.create_task(run_single(tc)) for tc in test_cases]
-            for task in asyncio.as_completed(tasks):
-                res = await task
-                results.append(res)
-                if self.stop_requested:
-                    break
+            try:
+                for task in asyncio.as_completed(tasks):
+                    res = await task
+                    results.append(res)
+                    if self.stop_requested:
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        break
+            finally:
+                pending = [t for t in tasks if not t.done()]
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
 
         duration_s = round(time.monotonic() - t0, 3)
 
-        # Aggregate telemetry
         passed = sum(1 for r in results if r.status == "PASS")
         failed = sum(1 for r in results if r.status == "FAIL")
         errors = sum(1 for r in results if r.status == "ERROR")
@@ -229,7 +309,6 @@ class Orchestrator:
             results=results,
         )
 
-        # Export CSV summary
         try:
             csv_path = Path(self.cfg.reporting.results_path)
             csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +320,6 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("Failed writing CSV results: %s", exc)
 
-        # Export JSON summary
         try:
             out_dir = Path(self.cfg.reporting.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +328,6 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("Failed writing JSON results: %s", exc)
 
-        # Export HTML report if enabled
         if self.cfg.reporting.generate_html_report:
             try:
                 html_path = Path(self.cfg.reporting.output_dir) / "report.html"
@@ -259,5 +336,5 @@ class Orchestrator:
                 logger.warning("Failed generating HTML report: %s", exc)
 
         await self.bus.emit(RunFinished(stats=summary.model_dump()))
-        await self.router.aclose()
+        await self.aclose()
         return summary

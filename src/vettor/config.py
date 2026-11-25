@@ -10,6 +10,19 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("vettor.config")
 
 
+def _default_agent_models() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if os.getenv("QA_PLANNER_MODEL"):
+        mapping["planner"] = os.getenv("QA_PLANNER_MODEL", "")
+    if os.getenv("QA_TRIAGE_MODEL"):
+        mapping["triage"] = os.getenv("QA_TRIAGE_MODEL", "")
+    if os.getenv("QA_UI_MODEL"):
+        mapping["ui"] = os.getenv("QA_UI_MODEL", "")
+    if os.getenv("QA_FUNCTIONAL_MODEL"):
+        mapping["functional"] = os.getenv("QA_FUNCTIONAL_MODEL", "")
+    return mapping
+
+
 class TargetConfig(BaseModel):
     """Target web application settings."""
 
@@ -43,11 +56,12 @@ class ProviderConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    """Model-agnostic LLM & VLM inference settings."""
+    """Model-agnostic LLM & VLM inference settings with per-agent routing."""
 
     active: str = Field(
         default_factory=lambda: os.getenv("QA_MODEL", "openai/gpt-4o-mini")
     )
+    agent_models: dict[str, str] = Field(default_factory=_default_agent_models)
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {
             "openai": ProviderConfig(
@@ -77,6 +91,8 @@ class ModelConfig(BaseModel):
         default_factory=lambda: os.getenv("QA_MODEL_PROFILE", "auto")  # type: ignore[return-value]
     )
     confidential: bool = Field(default_factory=lambda: os.getenv("QA_CONFIDENTIAL", "false").lower() == "true")
+    offline: bool = Field(default_factory=lambda: os.getenv("QA_OFFLINE", "false").lower() == "true")
+    use_heuristic_tier: bool = Field(default_factory=lambda: os.getenv("QA_HEURISTIC_TIER", "false").lower() == "true")
     allowed_private_hosts: list[str] = Field(default_factory=list)
     enable_visual_audit: bool = Field(default_factory=lambda: os.getenv("QA_VISUAL_AUDIT", "false").lower() == "true")
     temperature: float = 0.1
@@ -103,6 +119,15 @@ class ModelConfig(BaseModel):
     frontier_endpoint: str = Field(default_factory=lambda: os.getenv("FRONTIER_URL", ""))
     frontier_api_key: str = Field(default_factory=lambda: os.getenv("FRONTIER_API_KEY", ""))
     frontier_model: str = Field(default_factory=lambda: os.getenv("FRONTIER_MODEL", ""))
+
+    def resolve_agent_model(self, role: str) -> str:
+        """Returns the configured override model string for an agent role, or empty string if none."""
+        override = (self.agent_models.get(role) or "").strip()
+        if override:
+            return override
+        if role == "ui" and self.vlm_model.strip():
+            return self.vlm_model.strip()
+        return ""
 
     def parse_active(self) -> tuple[str, str]:
         """Splits `active` string on the first '/' into (provider_name, model_id)."""
@@ -196,6 +221,12 @@ class SuiteConfig(BaseModel):
     mode: Literal["data_driven", "autonomous_goal", "crawl_smoke"] = Field(
         default_factory=lambda: os.getenv("QA_MODE", "data_driven")  # type: ignore[return-value]
     )
+    permission_mode: Literal["read_only", "safe", "full"] = Field(
+        default_factory=lambda: os.getenv("QA_PERMISSION_MODE", "full")  # type: ignore[return-value]
+    )
+    sectors: list[str] = Field(
+        default_factory=lambda: ["functional", "ui", "a11y", "network", "console", "performance", "security", "seo"]
+    )
     cases_path: str = Field(default_factory=lambda: os.getenv("QA_CASES_PATH", "tests/fixtures/sample_cases.jsonl"))
     goal: str = Field(default_factory=lambda: os.getenv("QA_GOAL", ""))
     max_steps_per_case: int = 25
@@ -257,6 +288,16 @@ class VettorConfig(BaseModel):
     @start_url.setter
     def start_url(self, value: str) -> None:
         self.target.url = value
+
+    def for_agent(self, role: str) -> VettorConfig:
+        """Returns a config clone with `model.active` overridden for a specific agent role."""
+        override = self.model.resolve_agent_model(role)
+        if not override or override == self.model.active:
+            return self
+        cloned = self.model_copy(deep=True)
+        cloned.model.active = override
+        cloned.model.profile = "auto"
+        return cloned
 
     @classmethod
     def from_file(cls, path: str | Path) -> VettorConfig:

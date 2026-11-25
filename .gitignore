@@ -38,7 +38,7 @@ logs/
 # Vettor runtime artifacts & local models
 artifacts/
 failures/
-models/
+/models/
 *.gguf
 qa_memory.json
 results.csv

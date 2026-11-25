@@ -61,7 +61,7 @@ def test_evaluate_assertions_fallback_and_missing():
     results = evaluate_assertions(tc, obs, extracted={})
     assert len(results) == 1
     assert not results[0].passed
-    assert "String containment" in results[0].message
+    assert "not found" in results[0].message.lower()
 
 
 def test_handoff_manager_and_streaming(tmp_path: Path):
@@ -138,7 +138,8 @@ def test_generate_html_report(tmp_path: Path):
     assert html_path.exists()
 
     html_content = html_path.read_text(encoding="utf-8")
-    assert "Vettor QA Execution Report" in html_content
+    assert "Vettor Multi-Sector Web QA Report" in html_content
+    assert (tmp_path / "report.md").exists()
     # Dark mode styles check
     assert "#0f172a" in html_content or "#1e293b" in html_content
     # Results check

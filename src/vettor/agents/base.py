@@ -7,7 +7,7 @@ from vettor.config import VettorConfig
 from vettor.core.events import EventBus, LogMessage
 from vettor.core.llm import CompletionResult, ModelRouter
 from vettor.core.memory import QAMemory
-from vettor.core.schema import AgentAction, PageObservation
+from vettor.core.schema import AgentAction, PageObservation, SmallAgentAction
 
 logger = logging.getLogger("vettor.agents.base")
 
@@ -41,27 +41,42 @@ class BaseQAAgent:
             {"role": "system", "content": system_prompt},
         ]
 
-        # Context lines (e.g. test case inputs, active goals, cautions)
         if context_lines:
             ctx_text = "\n".join(context_lines)
             messages.append({"role": "user", "content": f"Task Context:\n{ctx_text}"})
 
-        # History window tailored to model profile: 2 turns for small, 8 turns for frontier
         profile = self.router.profile
         window_size = 2 if profile == "small" else 8
         recent_history = (history or [])[-window_size:]
         if recent_history:
             messages.append({"role": "user", "content": "Recent Steps:\n" + "\n".join(recent_history)})
 
-        # Compact observation
-        compact_obs = obs.to_compact_text()
+        compact_obs = obs.to_compact_text(
+            max_elements=40 if profile == "small" else 60,
+            body_chars=200 if profile == "small" else 400,
+        )
+
+        if profile == "small":
+            prompt = (
+                f"Current Page State:\n{compact_obs}\n\n"
+                "Rules: Skip fields whose val already matches the input. "
+                "Output ONLY valid JSON with keys: 'action' "
+                "('fill','select','check','uncheck','click','press','scroll','goto','wait','extract','assert_oracle','report_bug','done','stuck'), "
+                "integer 'vid' (or null), and 'value'."
+            )
+            messages.append({"role": "user", "content": prompt})
+            small_act, result = await self.router.complete_structured(messages, SmallAgentAction)
+            if isinstance(small_act, AgentAction):
+                return small_act, result
+            return small_act.to_agent_action(), result
+
         prompt = (
             f"Current Page State:\n{compact_obs}\n\n"
-            f"Select the next action. Output MUST be valid JSON with 'action' ('fill','select','check','uncheck','click','press','wait','done','stuck'), "
-            f"integer 'vid', 'value', and brief 'reason'."
+            "Select the next action. Output MUST be valid JSON with 'action' "
+            "('fill','select','check','uncheck','click','press','scroll','goto','wait','extract','assert_oracle','report_bug','done','stuck'), "
+            "integer 'vid', 'value', and brief 'reason'."
         )
         messages.append({"role": "user", "content": prompt})
-
         action, result = await self.router.complete_structured(messages, AgentAction)
         return action, result
 

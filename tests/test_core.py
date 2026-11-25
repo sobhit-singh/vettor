@@ -188,7 +188,8 @@ def test_agent_action_json_schema() -> None:
     assert "reason" in props
 
     # Check action enum/literal values
-    expected_actions = {"fill", "select", "check", "uncheck", "click", "press", "wait", "assert", "done", "stuck"}
+    from vettor.tools.registry import TOOL_REGISTRY
+    expected_actions = set(TOOL_REGISTRY.keys())
     action_schema = props["action"]
     enum_values = action_schema.get("enum") or [item.get("const") for item in action_schema.get("anyOf", []) if "const" in item]
     assert set(enum_values) == expected_actions

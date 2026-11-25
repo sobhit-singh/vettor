@@ -16,7 +16,10 @@ from vettor.config import VettorConfig
 from vettor.core.llama_server import find_llama_executable, find_model_gguf, is_loopback_url, is_server_alive
 from vettor.core.memory import QAMemory
 from vettor.core.recipe import RecipeCache
+from vettor.interfaces.mcp_server import serve_mcp_stdio
 from vettor.orchestrator import Orchestrator
+from vettor.plugins.loader import GLOBAL_PLUGINS
+from vettor.privacy.redactor import PrivacyAuditLog
 from vettor.reporting.handoff import HANDOFF_TEMPLATE, HandoffManager
 
 console = Console()
@@ -220,17 +223,29 @@ def cmd_run(args: argparse.Namespace) -> int:
             cfg.model.providers[prov].base_url = args.api_base
     if getattr(args, "suite", None):
         cfg.suite.cases_path = args.suite
+    if getattr(args, "offline", False):
+        cfg.model.offline = True
+        cfg.model.confidential = True
+    if getattr(args, "permission_mode", None):
+        cfg.suite.permission_mode = args.permission_mode
+    for mod_path in getattr(args, "plugin", None) or []:
+        GLOBAL_PLUGINS.load_module_plugin(mod_path)
 
-    run_headless = getattr(args, "cli", False)
+    run_headless = getattr(args, "cli", False) or getattr(args, "json", False)
 
     if run_headless:
         if not cfg.target.url:
             console.print("[yellow]No target set. Specify --url <url> or run without --cli to use the TUI.[/yellow]")
             return 1
 
-        console.print(f"[cyan]Starting Vettor CLI run against [bold]{cfg.target.url}[/bold] (workers={cfg.browser.workers})...[/cyan]")
+        if not getattr(args, "json", False):
+            console.print(f"[cyan]Starting Vettor CLI run against [bold]{cfg.target.url}[/bold] (workers={cfg.browser.workers})...[/cyan]")
         orchestrator = Orchestrator(cfg)
         summary = asyncio.run(orchestrator.run())
+
+        if getattr(args, "json", False):
+            print(summary.model_dump_json(indent=2))
+            return 0 if summary.failed == 0 and summary.errors == 0 else 1
 
         table = Table(title="Run Summary", show_header=True, header_style="bold green")
         table.add_column("Case ID", width=12)
@@ -361,6 +376,39 @@ def cmd_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Prints recent privacy & model egress audit log entries."""
+    cfg = _load_config(getattr(args, "config", None))
+    log = PrivacyAuditLog(f"{cfg.reporting.output_dir}/privacy_audit.jsonl")
+    entries = log.read_entries(limit=getattr(args, "limit", 50))
+    console.print(Panel.fit(f"[bold cyan]Vettor Privacy & Egress Audit Log ({log.path})[/bold cyan]"))
+    if not entries:
+        console.print("[dim]No audit entries recorded yet.[/dim]")
+        return 0
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Timestamp", width=24)
+    table.add_column("Provider", width=14)
+    table.add_column("Model", width=22)
+    table.add_column("Tier", width=10)
+    table.add_column("Redactions", width=10)
+    for e in entries:
+        table.add_row(
+            str(e.get("ts", ""))[:19],
+            str(e.get("provider", "")),
+            str(e.get("model", "")),
+            str(e.get("tier", "")),
+            str(e.get("redactions", 0)),
+        )
+    console.print(table)
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Starts the Vettor MCP stdio JSON-RPC server."""
+    cfg = _load_config(getattr(args, "config", None))
+    return serve_mcp_stdio(cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Primary entrypoint for the vettor CLI."""
     parser = argparse.ArgumentParser(
@@ -369,6 +417,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", "-c", help="Path to vettor.json configuration file")
     parser.add_argument("--cli", action="store_true", help="Run headless in CLI mode without TUI")
+    parser.add_argument("--json", action="store_true", help="Emit JSON RunSummary to stdout in headless mode")
+    parser.add_argument("--offline", action="store_true", help="Enforce strict offline/confidential zero-egress mode")
+    parser.add_argument("--permission-mode", choices=["read_only", "safe", "full"], help="Action permission mode")
+    parser.add_argument("--plugin", action="append", help="Dotted Python module path for BYOM/hook plugins")
     parser.add_argument("--url", "-u", type=str, help="Target application URL")
     parser.add_argument("--target", "-t", type=str, help="Target application URL")
     parser.add_argument("--model", "-m", type=str, help="Active model string (e.g. openai/gpt-4o-mini)")
@@ -382,15 +434,20 @@ def main(argv: list[str] | None = None) -> int:
     p_init = subparsers.add_parser("init", help="Scaffold a new Vettor workspace")
     p_init.add_argument("--force", "-f", action="store_true", help="Overwrite existing workspace files")
 
-    # check
-    p_check = subparsers.add_parser("check", help="Run pre-flight environment diagnostics")
-    p_check.add_argument("--url", "-u", type=str, help="Target application URL")
-    p_check.add_argument("--model", "-m", type=str, help="Active model string (e.g. openai/gpt-4o-mini)")
-    p_check.add_argument("--api-base", type=str, help="API base URL override")
+    # check / doctor
+    for cmd_name in ("check", "doctor"):
+        p_check = subparsers.add_parser(cmd_name, help="Run pre-flight environment diagnostics")
+        p_check.add_argument("--url", "-u", type=str, help="Target application URL")
+        p_check.add_argument("--model", "-m", type=str, help="Active model string (e.g. openai/gpt-4o-mini)")
+        p_check.add_argument("--api-base", type=str, help="API base URL override")
 
     # run
     p_run = subparsers.add_parser("run", help="Run the test suite")
     p_run.add_argument("--cli", action="store_true", help="Run headless in CLI mode without TUI")
+    p_run.add_argument("--json", action="store_true", help="Emit JSON RunSummary to stdout")
+    p_run.add_argument("--offline", action="store_true", help="Enforce strict offline/confidential mode")
+    p_run.add_argument("--permission-mode", choices=["read_only", "safe", "full"], help="Action permission mode")
+    p_run.add_argument("--plugin", action="append", help="Dotted Python module path for plugins")
     p_run.add_argument("--workers", "-w", type=int, help="Number of concurrent browser workers")
     p_run.add_argument("--target", "-t", type=str, help="Target application URL")
     p_run.add_argument("--url", "-u", type=str, help="Target application URL")
@@ -412,6 +469,13 @@ def main(argv: list[str] | None = None) -> int:
     p_mem = subparsers.add_parser("memory", help="Inspect or clear QA procedural memory")
     p_mem.add_argument("action", nargs="?", choices=["inspect", "clear"], default="inspect")
 
+    # audit
+    p_audit = subparsers.add_parser("audit", help="Inspect privacy & egress audit log")
+    p_audit.add_argument("--limit", type=int, default=50, help="Number of recent entries to display")
+
+    # mcp
+    subparsers.add_parser("mcp", help="Run Vettor MCP stdio server")
+
     parsed = parser.parse_args(argv)
 
     if parsed.command is None:
@@ -421,10 +485,13 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = {
         "init": cmd_init,
         "check": cmd_check,
+        "doctor": cmd_check,
         "run": cmd_run,
         "plan": cmd_plan,
         "handoff": cmd_handoff,
         "memory": cmd_memory,
+        "audit": cmd_audit,
+        "mcp": cmd_mcp,
     }
 
     handler = dispatch.get(parsed.command)

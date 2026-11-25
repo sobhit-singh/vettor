@@ -14,6 +14,10 @@ from pydantic import BaseModel
 
 from vettor.config import ProviderConfig, VettorConfig
 from vettor.core import llama_server
+from vettor.models.profiles import ModelCapabilityProfile, detect_detailed_profile
+from vettor.plugins.loader import GLOBAL_PLUGINS
+from vettor.privacy.redactor import PrivacyAuditLog, Redactor
+from vettor.tools.registry import parse_line_action
 
 logger = logging.getLogger("vettor.llm")
 
@@ -31,13 +35,29 @@ ModelProfile = Literal["small", "frontier"]
 
 
 def detect_model_profile(model_name: str, configured: str = "auto") -> ModelProfile:
-    """Detects whether a model should use the small (ReAct/1-step) or frontier (multi-step batch) profile."""
+    """Detects whether a model should use the small (ReAct/1-step) or frontier (multi-step batch) profile.
+
+    Uses boundary-aware regex so '32b', '72b', '14b', '24b' are NOT misclassified as '2b'/'4b',
+    while sub-1B ('360m', '500m', '0.5b', '0.6b', '0.8b') and 1B-4B models map to 'small'.
+    """
     if configured in ("small", "frontier"):
         return configured  # type: ignore[return-value]
 
     name_lower = (model_name or "").lower()
-    compact_markers = ("1.5b", "1.7b", "2b", "3b", "4b", "lfm", "tiny", "mini", "local-model")
-    if any(m in name_lower for m in compact_markers):
+    # Explicit sub-1B / million-parameter markers
+    if re.search(r"(?<![a-z0-9])(?:135|270|350|360|500|600|700|800)m(?![a-z0-9])", name_lower):
+        return "small"
+    # Parse billion-parameter count (e.g. 0.5b, 1b, 1.5b, 2b, 3b, 4b vs 7b, 14b, 32b, 72b)
+    m = re.search(r"(?<![0-9.])(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", name_lower)
+    if m:
+        try:
+            params_b = float(m.group(1))
+            return "small" if params_b <= 4.5 else "frontier"
+        except ValueError:
+            pass
+
+    compact_markers = ("lfm", "smollm", "tiny", "mini", "nano", "local-model", "qwen0.5", "gemma-3-1b")
+    if any(marker in name_lower for marker in compact_markers):
         return "small"
     return "frontier"
 
@@ -260,6 +280,8 @@ class ModelRouter:
         self.cfg = cfg
         self.use_frontier = use_frontier
         self._cooldown: dict[str, float] = {}
+        self.redactor = Redactor()
+        self.audit_log = PrivacyAuditLog(f"{cfg.reporting.output_dir}/privacy_audit.jsonl")
         self.providers: list[BaseProvider] = self._build()
 
     def _check_privacy(self, endpoint: str, provider_name: str, model_name: str = "") -> None:
@@ -335,6 +357,12 @@ class ModelRouter:
         if provider_name == "heuristic" or self.cfg.model.backend == "heuristic":
             return []
 
+        # Check BYOM / plugin provider registry first
+        if provider_name in GLOBAL_PLUGINS.providers:
+            factory = GLOBAL_PLUGINS.providers[provider_name]
+            providers.append(factory(self.cfg, model_id))
+            return providers
+
         p_cfg = self.cfg.model.providers.get(provider_name)
         if p_cfg is None:
             if provider_name == "litellm":
@@ -408,6 +436,10 @@ class ModelRouter:
     def profile(self) -> ModelProfile:
         return detect_model_profile(self.active_model, self.cfg.model.profile)
 
+    @property
+    def detailed_profile(self) -> ModelCapabilityProfile:
+        return detect_detailed_profile(self.active_model, self.cfg.model.profile)
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -446,14 +478,25 @@ class ModelRouter:
             if time.monotonic() < self._cooldown.get(provider.name, 0.0):
                 continue
 
+            # Apply PII/secret redaction before egress (Phase 5)
+            cleaned_messages, redaction_count = self.redactor.redact_messages(messages)
+            endpoint_url = getattr(provider, "endpoint", "") or getattr(provider, "api_base", "") or "local"
+
             attempt_kwargs = dict(call_kwargs)
             if response_format:
                 attempt_kwargs["response_format"] = response_format
 
             try:
-                res = await provider.complete(messages, **attempt_kwargs)
+                res = await provider.complete(cleaned_messages, **attempt_kwargs)
                 if res and res.text.strip():
                     self._cooldown.pop(provider.name, None)
+                    self.audit_log.record(
+                        provider=provider.name,
+                        model=provider.model,
+                        endpoint=endpoint_url,
+                        tier=self.detailed_profile.tier,
+                        redactions=redaction_count,
+                    )
                     return res
             except Exception as exc:
                 last_error = exc
@@ -466,15 +509,23 @@ class ModelRouter:
                     fallback_kwargs = dict(call_kwargs)
                     fallback_kwargs["response_format"] = {"type": "json_object"}
                     try:
-                        res = await provider.complete(messages, **fallback_kwargs)
+                        res = await provider.complete(cleaned_messages, **fallback_kwargs)
                         if res and res.text.strip():
                             self._cooldown.pop(provider.name, None)
+                            self.audit_log.record(
+                                provider=provider.name,
+                                model=provider.model,
+                                endpoint=endpoint_url,
+                                tier=self.detailed_profile.tier,
+                                redactions=redaction_count,
+                            )
                             return res
                     except Exception as exc2:
                         last_error = exc2
 
                 logger.warning("Provider %s failed (%s): %s", provider.name, type(exc).__name__, exc)
-                self._cooldown[provider.name] = time.monotonic() + COOLDOWN_S
+                if len(self.providers) > 1:
+                    self._cooldown[provider.name] = time.monotonic() + COOLDOWN_S
 
         raise ModelError(f"All model providers failed or are cooling down. Last error: {last_error}")
 
@@ -485,12 +536,13 @@ class ModelRouter:
         **kwargs: Any,
     ) -> tuple[T, CompletionResult]:
         """Requests constrained JSON structured output matching response_model, retrying with error feedback."""
+        custom_schema = kwargs.pop("json_schema_override", None)
         response_format = {
             "type": "json_schema",
             "json_schema": {
                 "name": response_model.__name__,
                 "strict": True,
-                "schema": response_model.model_json_schema(),
+                "schema": custom_schema or response_model.model_json_schema(),
             },
         }
 
@@ -501,6 +553,13 @@ class ModelRouter:
             validated = response_model.model_validate(raw_obj)
             return validated, completion_result
         except Exception as first_err:
+            # Line-format fallback for sub-1B / tiny models that emit e.g. `fill 3 "Alice"`
+            if response_model.__name__ in ("AgentAction", "SmallAgentAction"):
+                line_act = parse_line_action(completion_result.text)
+                if line_act is not None:
+                    validated_line = response_model.model_validate(line_act.model_dump())
+                    return validated_line, completion_result
+
             logger.warning(
                 "Structured completion validation failed on first attempt (%s): %s. Retrying with error feedback...",
                 type(first_err).__name__,

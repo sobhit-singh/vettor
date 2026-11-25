@@ -23,6 +23,8 @@ class PageSession:
         self.console_logs: list[str] = []
         self.page_errors: list[str] = []
         self.network_errors: list[dict[str, Any]] = []
+        self.network_requests: list[dict[str, Any]] = []
+        self._last_obs: PageObservation | None = None
 
     async def goto(
         self,
@@ -50,7 +52,16 @@ class PageSession:
 
     async def observe(self) -> PageObservation:
         """Extracts the interactive DOM structure and page observation."""
-        return await observe_page(self.page)
+        obs = await observe_page(self.page, prev_obs=self._last_obs)
+        self._last_obs = obs
+        return obs
+
+    async def _settle_after_action(self, wait_ms: int = 600) -> None:
+        """Briefly waits for SPA DOM/network settle without blocking on long-polling."""
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=wait_ms)
+        except Exception:
+            await asyncio.sleep(0.15)
 
     async def execute_action(
         self,
@@ -63,6 +74,19 @@ class PageSession:
             sleep_ms = min(int(action.value or 500), 5000)
             await asyncio.sleep(sleep_ms / 1000.0)
             return "wait"
+
+        if action.action == "scroll":
+            direction = (action.value or "down").strip().lower()
+            delta = -500 if direction == "up" else 500
+            await self.page.evaluate(f"window.scrollBy(0, {delta})")
+            await asyncio.sleep(0.15)
+            return f"scroll:{direction}"
+
+        if action.action == "goto":
+            if not action.value:
+                raise ValueError("Action 'goto' requires a URL in 'value'")
+            await self.goto(action.value)
+            return f"goto:{action.value}"
 
         # Resolve selector
         if selector_override:
@@ -98,7 +122,6 @@ class PageSession:
             elif action.action == "click":
                 await locator.click(timeout=timeout_ms)
             else:
-                # Default for check or fill with true-like value
                 await locator.check(timeout=timeout_ms)
             return target_selector
 
@@ -123,8 +146,10 @@ class PageSession:
                 await locator.fill(action.value, timeout=timeout_ms)
             elif action.action == "press":
                 await locator.press(action.value or "Enter", timeout=timeout_ms)
+                await self._settle_after_action()
             elif action.action == "click":
                 await locator.click(timeout=timeout_ms)
+                await self._settle_after_action()
             else:
                 await locator.fill(action.value, timeout=timeout_ms)
             return target_selector
@@ -132,10 +157,13 @@ class PageSession:
         # Button, link, or general interactive element
         if action.action in ("click", "fill"):
             await locator.click(timeout=timeout_ms)
+            await self._settle_after_action()
         elif action.action == "press":
             await locator.press(action.value or "Enter", timeout=timeout_ms)
+            await self._settle_after_action()
         elif action.action in ("check", "select"):
             await locator.click(timeout=timeout_ms)
+            await self._settle_after_action()
 
         return target_selector
 
@@ -178,7 +206,7 @@ class BrowserPool:
             slow_mo=self.cfg.browser.slow_mo_ms if self.cfg.browser.slow_mo_ms > 0 else None,
         )
 
-    async def new_session(self) -> PageSession:
+    async def new_session(self, storage_state: str | None = None) -> PageSession:
         """Spawns an isolated PageSession with target headers, storage state, and init scripts."""
         if self._browser is None:
             await self.start()
@@ -193,15 +221,15 @@ class BrowserPool:
         if self.cfg.target.auth_headers:
             context_kwargs["extra_http_headers"] = self.cfg.target.auth_headers
 
-        if self.cfg.target.storage_state and Path(self.cfg.target.storage_state).exists():
-            context_kwargs["storage_state"] = self.cfg.target.storage_state
+        effective_storage = storage_state or self.cfg.target.storage_state
+        if effective_storage and Path(effective_storage).exists():
+            context_kwargs["storage_state"] = effective_storage
 
         context = await self._browser.new_context(**context_kwargs)
 
         if self.cfg.target.cookies:
             await context.add_cookies(self.cfg.target.cookies)
 
-        # Inject local_storage and session_storage via context.add_init_script before page loads
         if self.cfg.target.local_storage or self.cfg.target.session_storage:
             ls_data = json.dumps(self.cfg.target.local_storage)
             ss_data = json.dumps(self.cfg.target.session_storage)
@@ -226,7 +254,6 @@ class BrowserPool:
         page = await context.new_page()
         session = PageSession(context, page)
 
-        # Attach listeners for console logs, unhandled exceptions, and 4xx/5xx responses
         page.on("console", lambda msg: session.console_logs.append(f"[{msg.type}] {msg.text}"))
         page.on("pageerror", lambda err: session.page_errors.append(str(err)))
 

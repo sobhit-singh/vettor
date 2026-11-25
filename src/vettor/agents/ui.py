@@ -29,7 +29,7 @@ class UIAgent(BaseQAAgent):
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
-        self._audited_signatures: set[tuple[Any, ...]] = set()
+        self._audited_signatures: dict[int, set[tuple[Any, ...]]] = {}
 
     async def audit_page(
         self,
@@ -37,20 +37,30 @@ class UIAgent(BaseQAAgent):
         obs: PageObservation,
         case_id: str,
     ) -> list[Finding]:
-        """Audits current page state with zero-LLM probes and optional visual audit, deduplicating by signature."""
+        """Audits current page state with zero-LLM probes and optional visual audit, deduplicating per session."""
+        session_key = id(session)
+        seen = self._audited_signatures.setdefault(session_key, set())
         sig = obs.signature()
-        if sig in self._audited_signatures:
+        if sig in seen:
             return []
-        self._audited_signatures.add(sig)
+        seen.add(sig)
 
         findings: list[Finding] = []
+
+        # Drain runtime error buffers so findings do not duplicate across steps (B-08)
+        net_errs = list(getattr(session, "network_errors", []))
+        if hasattr(session, "network_errors") and isinstance(session.network_errors, list):
+            session.network_errors.clear()
+        pg_errs = list(getattr(session, "page_errors", []))
+        if hasattr(session, "page_errors") and isinstance(session.page_errors, list):
+            session.page_errors.clear()
 
         # 1. Deterministic probes (layout overflow, broken images, overlap, network & JS errors)
         probe_findings = await run_ui_probes(
             session.page,
             page_path=obs.pathname,
-            network_errors=session.network_errors,
-            page_errors=session.page_errors,
+            network_errors=net_errs,
+            page_errors=pg_errs,
         )
         findings.extend(probe_findings)
 
